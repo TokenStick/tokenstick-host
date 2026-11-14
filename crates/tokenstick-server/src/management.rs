@@ -106,7 +106,8 @@ pub(crate) async fn device_snapshot(state: &AppState) -> Result<Vec<Value>, ApiE
             .map(|d| {
                 let telemetry = backend.telemetry(&d.id)?;
                 let loaded = backend.loaded_model(&d.id)?;
-                Ok((d, telemetry, loaded))
+                let power = backend.power_mode(&d.id)?;
+                Ok((d, telemetry, loaded, power))
             })
             .collect::<libtokenstick::Result<Vec<_>>>()
     })
@@ -115,10 +116,11 @@ pub(crate) async fn device_snapshot(state: &AppState) -> Result<Vec<Value>, ApiE
 
     Ok(rows
         .into_iter()
-        .map(|(d, t, loaded)| {
+        .map(|(d, t, loaded, power)| {
             json!({
                 "busy": state.is_busy(&d.id),
                 "loaded_model": loaded,
+                "power_mode": power,
                 "telemetry": t,
                 "device": d,
             })

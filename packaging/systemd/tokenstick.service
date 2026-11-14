@@ -1,0 +1,36 @@
+[Unit]
+Description=TokenStick inference server (OpenAI-compatible API and web UI)
+Documentation=https://github.com/TokenStick/tokenstick-host
+# On the RK182X dev kits the vendor runtime runs as rknn3.service; start after it when present.
+After=network-online.target rknn3.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=tokenstick
+Group=tokenstick
+EnvironmentFile=-/etc/default/tokenstick
+Environment=TOKENSTICK_MODELS_DIR=/var/lib/tokenstick/models
+ExecStart=/usr/local/bin/tokenstick serve
+Restart=on-failure
+RestartSec=3
+# serve drains in-flight requests on SIGTERM before exiting.
+KillSignal=SIGTERM
+TimeoutStopSec=30
+StateDirectory=tokenstick
+StateDirectoryMode=0755
+
+# Hardening. No PrivateDevices: the backends need the accelerator device nodes.
+# If the vendor driver's device node needs a group, add it here (verify on the kit):
+# SupplementaryGroups=video render
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target

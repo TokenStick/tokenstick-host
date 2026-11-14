@@ -5,9 +5,12 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use std::path::PathBuf;
+
+use libtokenstick::model_store::ModelStore;
 use libtokenstick::{
     ensure_loaded, resolve_device, Backend, BackendKind, GenerationParams, GenerationRequest,
-    GenerationStats, Message, Role,
+    GenerationStats, Message, PowerMode, Role,
 };
 use serde::Serialize;
 
@@ -70,10 +73,31 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Show or set the NPU power mode: low-power, balanced, performance.
+    Power { mode: Option<PowerMode> },
+    /// Inspect the local model store.
+    Store {
+        #[command(subcommand)]
+        command: StoreCommand,
+    },
     /// Start the OpenAI-compatible HTTP server.
     Serve {
         #[arg(long, env = "TOKENSTICK_ADDR", default_value = "127.0.0.1:8080")]
         addr: SocketAddr,
+    },
+}
+
+#[derive(Subcommand)]
+enum StoreCommand {
+    /// Print the store directory.
+    Path,
+    /// List models in the store and whether all their files are present.
+    List {
+        /// Store directory (default: $TOKENSTICK_MODELS_DIR or ~/.local/share/tokenstick/models).
+        #[arg(long)]
+        dir: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -116,6 +140,8 @@ fn main() -> Result<()> {
             &prompt,
             json,
         ),
+        Command::Power { mode } => power(backend.as_ref(), device, mode),
+        Command::Store { command } => store(command),
         Command::Serve { addr } => {
             tokio::runtime::Runtime::new()?.block_on(tokenstick_server::serve(backend, addr))
         }
@@ -150,12 +176,15 @@ fn status(backend: &dyn Backend, json: bool) -> Result<()> {
     for dev in backend.devices()? {
         let tel = backend.telemetry(&dev.id)?;
         let loaded = backend.loaded_model(&dev.id)?;
-        rows.push((dev, tel, loaded));
+        let power = backend.power_mode(&dev.id)?;
+        rows.push((dev, tel, loaded, power));
     }
     if json {
         let out: Vec<_> = rows
             .iter()
-            .map(|(d, t, l)| serde_json::json!({ "device": d, "telemetry": t, "loaded_model": l }))
+            .map(|(d, t, l, p)| {
+                serde_json::json!({ "device": d, "telemetry": t, "loaded_model": l, "power_mode": p })
+            })
             .collect();
         println!("{}", serde_json::to_string_pretty(&out)?);
         return Ok(());
@@ -163,7 +192,7 @@ fn status(backend: &dyn Backend, json: bool) -> Result<()> {
     if rows.is_empty() {
         println!("No devices found (backend: {}).", backend.name());
     }
-    for (dev, t, loaded) in rows {
+    for (dev, t, loaded, power) in rows {
         println!(
             "{}  {}  {} MiB  fw {}",
             dev.id,
@@ -171,7 +200,11 @@ fn status(backend: &dyn Backend, json: bool) -> Result<()> {
             dev.memory_mib,
             dev.firmware.as_deref().unwrap_or("-")
         );
-        println!("    model {}", loaded.as_deref().unwrap_or("(none loaded)"));
+        println!(
+            "    model {}  power {}",
+            loaded.as_deref().unwrap_or("(none loaded)"),
+            power
+        );
         println!(
             "    temp {}  power {}  npu {}  pd {}",
             fmt_opt(t.temperature_c, "°C"),
@@ -293,6 +326,7 @@ struct BenchReport {
     backend: String,
     device: String,
     model: String,
+    power_mode: PowerMode,
     load_ms: f64,
     runs: Vec<GenerationStats>,
     mean_ttft_ms: f64,
@@ -334,6 +368,7 @@ fn bench(
     let n = results.len() as f64;
     let report = BenchReport {
         backend: backend.name().into(),
+        power_mode: backend.power_mode(&device)?,
         device,
         model: model.into(),
         load_ms,
@@ -345,14 +380,97 @@ fn bench(
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
         println!(
-            "mean:  ttft {:.1} ms  {:.1} tok/s  load {:.0} ms  ({} runs, {} on {})",
+            "mean:  ttft {:.1} ms  {:.1} tok/s  load {:.0} ms  ({} runs, {} on {}, {})",
             report.mean_ttft_ms,
             report.mean_tokens_per_s,
             report.load_ms,
             runs,
             report.backend,
-            report.device
+            report.device,
+            report.power_mode
         );
+    }
+    Ok(())
+}
+
+fn power(backend: &dyn Backend, device: Option<&str>, mode: Option<PowerMode>) -> Result<()> {
+    let devices: Vec<String> = match device {
+        Some(id) => vec![resolve_device(backend, Some(id), "")?],
+        None => backend.devices()?.into_iter().map(|d| d.id).collect(),
+    };
+    for id in devices {
+        if let Some(m) = mode {
+            backend.set_power_mode(&id, m)?;
+        }
+        println!("{id}  {}", backend.power_mode(&id)?);
+    }
+    Ok(())
+}
+
+fn store(command: StoreCommand) -> Result<()> {
+    match command {
+        StoreCommand::Path => {
+            println!("{}", ModelStore::default_location()?.root().display());
+        }
+        StoreCommand::List { dir, json } => {
+            let store = match dir {
+                Some(d) => ModelStore::new(d),
+                None => ModelStore::default_location()?,
+            };
+            let report = store.scan()?;
+            if json {
+                let models: Vec<_> = report
+                    .models
+                    .iter()
+                    .map(|m| {
+                        serde_json::json!({
+                            "manifest": m.manifest,
+                            "dir": m.dir,
+                            "missing_files": m.missing_files(),
+                        })
+                    })
+                    .collect();
+                let problems: Vec<_> = report
+                    .problems
+                    .iter()
+                    .map(|(d, e)| serde_json::json!({ "dir": d, "error": e }))
+                    .collect();
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "root": store.root(),
+                        "models": models,
+                        "problems": problems,
+                    }))?
+                );
+                return Ok(());
+            }
+            if report.models.is_empty() && report.problems.is_empty() {
+                println!("No models in {}", store.root().display());
+            }
+            for m in &report.models {
+                let missing = m.missing_files();
+                let state = if missing.is_empty() {
+                    "ok".to_string()
+                } else {
+                    format!("missing: {}", missing.join(", "))
+                };
+                println!(
+                    "{:<34} {:>5.1}B  {:<6} {:<7} host {:>5} MiB  {}",
+                    m.manifest.id,
+                    m.manifest.params_b,
+                    m.manifest.quantization,
+                    m.manifest.target,
+                    m.manifest
+                        .host_mem_mib
+                        .map_or("?".to_string(), |v| v.to_string()),
+                    state
+                );
+            }
+            for (dir, err) in &report.problems {
+                eprintln!("skipped {}: {err}", dir.display());
+            }
+        }
     }
     Ok(())
 }
