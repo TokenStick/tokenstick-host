@@ -62,7 +62,7 @@
           <span class="label">NPU load</span>
           <span class="big mono"><span id="t-npu">–</span><small>%</small></span>
           <div class="bar"><div id="t-npu-bar" style="background:var(--text)"></div></div>
-          <span class="hint"><span id="t-active">0</span> active requests</span>
+          <span class="hint" id="t-active">No active requests</span>
         </div>
         <div class="card tile">
           <span class="label">Decode speed</span>
@@ -73,7 +73,7 @@
 
       <section class="charts" aria-label="History">
         <figure class="card chart">
-          <figcaption>Temperature &amp; power<span>last 5 min</span></figcaption>
+          <figcaption>Temperature &amp; power<span id="thermal-window">last 5 min</span></figcaption>
           <svg id="chart-thermal" viewBox="0 0 520 160" preserveAspectRatio="none" role="img" aria-label="Temperature and power over the last five minutes">
             <path class="grid" d="M0 40H520M0 80H520M0 120H520"/>
             <polyline id="line-temp" class="line-temp" points=""/>

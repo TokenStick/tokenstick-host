@@ -102,7 +102,8 @@ function renderTelemetry(devices, stats) {
   setTile("t-temp", t.temperature_c, 1, "t-temp-bar", THROTTLE_C);
   setTile("t-power", t.power_w, 1, "t-power-bar", PD_BUDGET_W);
   setTile("t-npu", t.npu_load_pct, 0, "t-npu-bar", 100);
-  $("t-active").textContent = stats.active_requests;
+  const n = stats.active_requests;
+  $("t-active").textContent = n === 0 ? "No active requests" : `${n} active request${n === 1 ? "" : "s"}`;
 
   $("m-temp").textContent = t.temperature_c == null ? "–" : `${fmt(t.temperature_c)} °C`;
   $("m-power").textContent = t.power_w == null ? "–" : `${fmt(t.power_w)} W`;
@@ -116,9 +117,15 @@ function renderTelemetry(devices, stats) {
   }
 }
 
+// Until the 5 min buffer fills, stretch what we have (at least 60 s) across
+// the chart instead of leaving it squeezed against the right edge.
+const MIN_WINDOW = 60;
+const chartWindow = () => Math.max(MIN_WINDOW, Math.min(HISTORY_POINTS, state.history.length));
+
 function polyline(values, lo, hi) {
-  const n = HISTORY_POINTS - 1;
-  const offset = HISTORY_POINTS - values.length;
+  const win = chartWindow();
+  const n = win - 1;
+  const offset = win - values.length;
   return values
     .map((v, i) => {
       if (v == null) return null;
@@ -133,6 +140,8 @@ function polyline(values, lo, hi) {
 function renderCharts(stats) {
   $("line-temp").setAttribute("points", polyline(state.history.map((h) => h.temp), 30, 90));
   $("line-power").setAttribute("points", polyline(state.history.map((h) => h.power), 0, 20));
+  const win = chartWindow();
+  $("thermal-window").textContent = win >= HISTORY_POINTS ? "last 5 min" : win < 120 ? `last ${win} s` : `last ${Math.round(win / 60)} min`;
 
   const recent = stats.recent.slice(0, 12).reverse();
   const g = $("tps-bars");

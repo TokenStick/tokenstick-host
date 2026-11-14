@@ -42,6 +42,14 @@ curl -N http://127.0.0.1:8080/v1/chat/completions \
 
 ## Web UI
 
+<p align="center">
+  <img src="docs/assets/ui-dashboard.png" alt="TokenStick web UI dashboard: device card, live temperature, power, NPU load and decode speed tiles, a temperature and power chart, throughput bars and a table of recent requests" width="100%">
+</p>
+<p align="center">
+  <img src="docs/assets/ui-playground.png" alt="TokenStick web UI playground: a streaming chat with per-reply token count, TTFT and tok/s, and a settings panel with model, system prompt, temperature, top-p, max tokens and live device readings" width="100%">
+</p>
+<p align="center"><sub>Dashboard and Playground running on the <code>mock</code> backend. All numbers are simulated, not RK1828 measurements.</sub></p>
+
 `tokenstick serve` also serves a web UI at `/`. It is plain HTML/CSS/JS compiled into the binary (`crates/tokenstick-server/ui/`), so headless hosts like the RK3576 kit or a Raspberry Pi serve it with no extra files and the build needs no Node toolchain. The same UI will be wrapped by Tauri for the desktop tray app.
 
 - **Dashboard**: devices, live temperature / power / NPU load, last 5 min chart, throughput per request, recent requests
