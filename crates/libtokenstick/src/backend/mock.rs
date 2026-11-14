@@ -20,12 +20,26 @@ const DEVICE_ID: &str = "mock0";
 const DEFAULT_TOKEN_DELAY: Duration = Duration::from_millis(25);
 const DEFAULT_LOAD_DELAY: Duration = Duration::from_millis(300);
 
+const IDLE_TEMP_C: f32 = 42.0;
+const LOAD_TEMP_C: f32 = 63.0;
+/// Thermal time constant: how fast the simulated die approaches its target.
+const THERMAL_TAU_S: f32 = 25.0;
+const IDLE_POWER_W: f32 = 2.5;
+
+/// First-order thermal model so dashboards see the stick warm up under load
+/// and cool down when idle.
+struct Thermal {
+    temp_c: f32,
+    updated: Instant,
+}
+
 pub struct MockBackend {
     token_delay: Duration,
     load_delay: Duration,
     loaded: Mutex<Option<String>>,
     power: Mutex<PowerMode>,
     busy: AtomicBool,
+    thermal: Mutex<Thermal>,
     tokens_generated: AtomicU64,
 }
 
@@ -76,7 +90,36 @@ impl MockBackend {
             loaded: Mutex::new(None),
             power: Mutex::new(PowerMode::Balanced),
             busy: AtomicBool::new(false),
+            thermal: Mutex::new(Thermal {
+                temp_c: IDLE_TEMP_C,
+                updated: Instant::now(),
+            }),
             tokens_generated: AtomicU64::new(0),
+        }
+    }
+
+    /// Total tokens generated since the backend was opened.
+    pub fn tokens_generated(&self) -> u64 {
+        self.tokens_generated.load(Ordering::Relaxed)
+    }
+
+    /// Advance the thermal model to now, using the load state of the elapsed interval.
+    fn step_thermal(&self, busy: bool) -> f32 {
+        let mut th = self.thermal.lock().unwrap_or_else(|e| e.into_inner());
+        let now = Instant::now();
+        let dt = now.duration_since(th.updated).as_secs_f32();
+        th.updated = now;
+        let target = if busy { LOAD_TEMP_C } else { IDLE_TEMP_C };
+        let alpha = 1.0 - (-dt / THERMAL_TAU_S).exp();
+        th.temp_c += (target - th.temp_c) * alpha;
+        th.temp_c
+    }
+
+    fn load_power_w(&self) -> f32 {
+        match *self.power.lock().expect("mock state poisoned") {
+            PowerMode::LowPower => 4.0,
+            PowerMode::Balanced => 6.8,
+            PowerMode::Performance => 9.5,
         }
     }
 
@@ -154,14 +197,18 @@ impl Backend for MockBackend {
 
     fn telemetry(&self, device_id: &str) -> Result<Telemetry> {
         Self::check_device(device_id)?;
-        // Warm up slowly with generated tokens, capped like a real thermal limit.
-        let load = self.tokens_generated.load(Ordering::Relaxed) as f32;
         let busy = self.busy.load(Ordering::Relaxed);
+        let temp = self.step_thermal(busy);
         Ok(Telemetry {
-            temperature_c: Some((42.0 + load / 200.0).min(88.0)),
-            power_w: Some(if busy { 9.5 } else { 2.5 }),
+            temperature_c: Some((temp * 10.0).round() / 10.0),
+            power_w: Some(if busy {
+                self.load_power_w()
+            } else {
+                IDLE_POWER_W
+            }),
             npu_load_pct: Some(if busy { 85.0 } else { 0.0 }),
-            pd_contract: None,
+            // Simulates the TokenStick PD sink contract (9 V / 2 A = 18 W budget).
+            pd_contract: Some("9V/2A".into()),
         })
     }
 
@@ -222,6 +269,8 @@ impl Backend for MockBackend {
         if req.messages.is_empty() {
             return Err(Error::InvalidRequest("messages must not be empty".into()));
         }
+        // Bring the thermal model up to now at idle before the job starts.
+        self.step_thermal(false);
         let _busy = BusyGuard::acquire(&self.busy)?;
 
         let prompt_tokens = req.messages.iter().map(|m| approx_tokens(&m.content)).sum();
@@ -364,6 +413,24 @@ mod tests {
         })
         .unwrap();
         assert!(matches!(nested, Some(Err(Error::Busy(_)))));
+    }
+
+    #[test]
+    fn telemetry_reflects_load() {
+        let b = backend();
+        let idle = b.telemetry(DEVICE_ID).unwrap();
+        assert_eq!(idle.npu_load_pct, Some(0.0));
+        assert_eq!(idle.power_w, Some(IDLE_POWER_W));
+        let mut busy = None;
+        b.generate(DEVICE_ID, &request(2), &mut |_| {
+            busy.get_or_insert_with(|| b.telemetry(DEVICE_ID).unwrap());
+            ControlFlow::Continue(())
+        })
+        .unwrap();
+        let busy = busy.unwrap();
+        assert!(busy.npu_load_pct.unwrap() > 0.0);
+        assert_eq!(busy.power_w, Some(6.8));
+        assert_eq!(b.telemetry(DEVICE_ID).unwrap().npu_load_pct, Some(0.0));
     }
 
     #[test]

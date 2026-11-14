@@ -13,8 +13,9 @@ Phase 0a: everything that can be built before RK1828 hardware arrives. Only the 
 - Mock backend: simulated RK1828 with token and load delays, power modes, telemetry, and `Busy` errors when jobs overlap.
 - Local model store (`model_store`): per-model directories with `manifest.json` for the RKNN3 file set (`.rknn`, `.weight`, `.tokenizer.gguf`, `.embed.bin`), host RAM estimate per model.
 - `tokenstick-server`: OpenAI-compatible `/v1/models` and `/v1/chat/completions` (SSE streaming, text content parts, `max_completion_tokens`), per-device FIFO queue with `503` back-pressure, client-disconnect cancellation, graceful shutdown on Ctrl-C and SIGTERM.
-- Management API: `/api/v1/info`, `/api/v1/devices`, `/api/v1/stats`, `/api/v1/events` (SSE), plus `/v1/tokenstick/status`.
-- Embedded web UI at `/`: Dashboard, Playground (streaming chat with stop), Server page with client snippets.
+- Management API: `/api/v1/info`, `/api/v1/devices` (telemetry, loaded model, power mode, busy), `/api/v1/stats` (counters, last 50 requests, queue), `/api/v1/events` (SSE snapshot every second), plus `/v1/tokenstick/status`. Request monitor with caller labels from the `x-tokenstick-client` header.
+- Embedded web UI at `/` with the TokenStick logotype: Dashboard (device card, temperature / power / NPU load with throttle and PD budget bars, 5 min chart, per-request throughput, queue, recent requests), Playground (streaming chat, system prompt, temperature, top-p, max tokens, stop), Server page with curl / Python / JavaScript snippets.
+- Mock telemetry follows load: first-order thermal model, NPU load and power per power mode.
 - `tokenstick` CLI: `status`, `models`, `run`, `bench` (load time, TTFT, tok/s, power mode, JSON output), `power`, `store path|list`, `serve`.
 - Packaging: systemd unit, `/etc/default/tokenstick`, `scripts/install.sh` (local or `--version` download with checksum).
 - CI (fmt, clippy, tests, aarch64 cross-build) and tag-driven release workflow for x86_64 and aarch64 tarballs.
