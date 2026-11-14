@@ -9,7 +9,7 @@ Host software for [TokenStick](https://github.com/TokenStick), the open-source U
 | Crate | Purpose |
 | --- | --- |
 | `libtokenstick` | Core library. Every caller reaches hardware only through the `Backend` trait. |
-| `tokenstick-server` | OpenAI-compatible HTTP API (`/v1/models`, `/v1/chat/completions` with streaming). |
+| `tokenstick-server` | OpenAI-compatible HTTP API (`/v1/models`, `/v1/chat/completions` with streaming), management API (`/api/v1/*`) and the embedded web UI. |
 | `tokenstick-cli` | The `tokenstick` binary: `status`, `models`, `run`, `bench`, `serve`. |
 
 Backends:
@@ -32,13 +32,32 @@ cargo build --release
 ./target/release/tokenstick serve --addr 127.0.0.1:8080
 ```
 
-Then point any OpenAI client at `http://127.0.0.1:8080/v1`:
+Open `http://127.0.0.1:8080/` for the web UI (Dashboard, Playground, Server), or point any OpenAI client at `http://127.0.0.1:8080/v1`:
 
 ```sh
 curl -N http://127.0.0.1:8080/v1/chat/completions \
   -H 'content-type: application/json' \
   -d '{"model":"qwen2.5-1.5b-instruct-w4a16","messages":[{"role":"user","content":"hi"}],"stream":true}'
 ```
+
+## Web UI
+
+`tokenstick serve` also serves a web UI at `/`. It is plain HTML/CSS/JS compiled into the binary (`crates/tokenstick-server/ui/`), so headless hosts like the RK3576 kit or a Raspberry Pi serve it with no extra files and the build needs no Node toolchain. The same UI will be wrapped by Tauri for the desktop tray app.
+
+- **Dashboard**: devices, live temperature / power / NPU load, last 5 min chart, throughput per request, recent requests
+- **Playground**: streaming chat with model picker, system prompt, temperature, top-p, max tokens
+- **Server**: endpoint URL and copyable curl / Python / JavaScript snippets
+
+Management API used by the UI:
+
+| Endpoint | Returns |
+| --- | --- |
+| `GET /api/v1/info` | Backend, version, uptime |
+| `GET /api/v1/devices` | Devices with current telemetry |
+| `GET /api/v1/stats` | Request counters and the last 50 requests |
+| `GET /api/v1/events` | Server-sent events: a `snapshot` (devices + stats) every second |
+
+Set the `x-tokenstick-client` header on `/v1/chat/completions` to label your requests on the dashboard.
 
 Environment variables:
 

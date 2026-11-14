@@ -1,9 +1,11 @@
 # Architecture
 
 ```
- OpenAI clients / Open WebUI / curl          tokenstick CLI
-                 |                                  |
-         tokenstick-server  <-----------------------+  (serve)
+ OpenAI clients / Open WebUI / curl    web UI (browser, Tauri)    tokenstick CLI
+                 |                       |  /api/v1/*, SSE             |
+                 +-----------+-----------+                             |
+                             |                                         |
+                     tokenstick-server  <------------------------------+  (serve)
                  |
            libtokenstick ── Backend trait
                  |
@@ -25,6 +27,12 @@
 | `generate(req, sink)` | Streams text pieces into `sink`, returns `GenerationStats` (TTFT, tok/s, finish reason) |
 
 Methods are blocking on purpose: the vendor runtime is a C library and USB transfers are synchronous. The server runs them on Tokio's blocking pool and bridges tokens to SSE through a channel. A closed channel makes the sink return `Break`, which cancels generation when a client disconnects.
+
+## Web UI
+
+One UI, two shells. `tokenstick-server` embeds a plain HTML/CSS/JS UI (`crates/tokenstick-server/ui/`) and serves it at `/`, next to the OpenAI API. A management API (`/api/v1/info`, `/devices`, `/stats`, `/events`) feeds it; `/events` is server-sent events with one snapshot per second, which is enough for telemetry and keeps the server simple. WebSocket comes only if the UI needs to push commands. The desktop tray app (Phase 3) wraps the same UI with Tauri.
+
+The server keeps a small in-memory `Monitor` (active requests, totals, last 50 requests with their `GenerationStats`) so the dashboard can show throughput without polling the backend for history.
 
 ## Why PCIe first
 

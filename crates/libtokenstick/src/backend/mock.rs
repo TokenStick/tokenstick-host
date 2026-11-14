@@ -5,7 +5,8 @@
 //! benchmark harness can be built before the kit arrives.
 
 use std::ops::ControlFlow;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use super::{Backend, TokenSink};
@@ -17,9 +18,35 @@ use crate::{
 const DEVICE_ID: &str = "mock0";
 const DEFAULT_DELAY: Duration = Duration::from_millis(25);
 
+const IDLE_TEMP_C: f32 = 42.0;
+const LOAD_TEMP_C: f32 = 63.0;
+/// Thermal time constant: how fast the simulated die approaches its target.
+const THERMAL_TAU_S: f32 = 25.0;
+const IDLE_POWER_W: f32 = 2.5;
+const LOAD_POWER_W: f32 = 6.8;
+
+/// First-order thermal model so dashboards see the stick warm up under load
+/// and cool down when idle.
+struct Thermal {
+    temp_c: f32,
+    updated: Instant,
+}
+
 pub struct MockBackend {
     token_delay: Duration,
     tokens_generated: AtomicU64,
+    active: AtomicU32,
+    thermal: Mutex<Thermal>,
+}
+
+/// Decrements the active-generation counter when a generation ends, even on
+/// early return.
+struct ActiveGuard<'a>(&'a AtomicU32);
+
+impl Drop for ActiveGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 impl MockBackend {
@@ -38,7 +65,28 @@ impl MockBackend {
         Self {
             token_delay,
             tokens_generated: AtomicU64::new(0),
+            active: AtomicU32::new(0),
+            thermal: Mutex::new(Thermal {
+                temp_c: IDLE_TEMP_C,
+                updated: Instant::now(),
+            }),
         }
+    }
+
+    /// Total tokens generated since the backend was opened.
+    pub fn tokens_generated(&self) -> u64 {
+        self.tokens_generated.load(Ordering::Relaxed)
+    }
+
+    fn step_thermal(&self, busy: bool) -> f32 {
+        let mut th = self.thermal.lock().unwrap_or_else(|e| e.into_inner());
+        let now = Instant::now();
+        let dt = now.duration_since(th.updated).as_secs_f32();
+        th.updated = now;
+        let target = if busy { LOAD_TEMP_C } else { IDLE_TEMP_C };
+        let alpha = 1.0 - (-dt / THERMAL_TAU_S).exp();
+        th.temp_c += (target - th.temp_c) * alpha;
+        th.temp_c
     }
 
     fn reply_for(req: &GenerationRequest) -> String {
@@ -113,13 +161,19 @@ impl Backend for MockBackend {
         if device_id != DEVICE_ID {
             return Err(Error::DeviceNotFound(device_id.into()));
         }
-        // Warm up slowly with generated tokens, capped like a real thermal limit.
-        let load = self.tokens_generated.load(Ordering::Relaxed) as f32;
+        let active = self.active.load(Ordering::Relaxed);
+        let busy = active > 0;
+        let temp = self.step_thermal(busy);
+        let (power, load) = if busy {
+            (LOAD_POWER_W, (70.0 + 12.0 * active as f32).min(100.0))
+        } else {
+            (IDLE_POWER_W, 0.0)
+        };
         Ok(Telemetry {
-            temperature_c: Some((42.0 + load / 200.0).min(88.0)),
-            power_w: Some(2.5),
-            npu_load_pct: Some(0.0),
-            pd_contract: None,
+            temperature_c: Some((temp * 10.0).round() / 10.0),
+            power_w: Some(power),
+            npu_load_pct: Some(load),
+            pd_contract: Some("9V/2A".into()),
         })
     }
 
@@ -138,6 +192,11 @@ impl Backend for MockBackend {
         if req.messages.is_empty() {
             return Err(Error::InvalidRequest("messages must not be empty".into()));
         }
+
+        // Warm the thermal model up to "now" at the previous load before going busy.
+        self.step_thermal(self.active.load(Ordering::Relaxed) > 0);
+        self.active.fetch_add(1, Ordering::Relaxed);
+        let _active = ActiveGuard(&self.active);
 
         let prompt_tokens = req.messages.iter().map(|m| approx_tokens(&m.content)).sum();
         let reply = Self::reply_for(req);
@@ -241,6 +300,30 @@ mod tests {
             .unwrap();
         assert_eq!(stats.completion_tokens, 1);
         assert_eq!(stats.finish_reason, FinishReason::Cancelled);
+    }
+
+    #[test]
+    fn telemetry_reflects_load() {
+        let backend = MockBackend::with_delay(Duration::ZERO);
+        let idle = backend.telemetry(DEVICE_ID).unwrap();
+        assert_eq!(idle.npu_load_pct, Some(0.0));
+        assert_eq!(idle.power_w, Some(IDLE_POWER_W));
+
+        let mut busy = None;
+        backend
+            .generate(&request(2), &mut |_| {
+                busy.get_or_insert_with(|| backend.telemetry(DEVICE_ID).unwrap());
+                ControlFlow::Continue(())
+            })
+            .unwrap();
+        let busy = busy.unwrap();
+        assert!(busy.npu_load_pct.unwrap() > 0.0);
+        assert_eq!(busy.power_w, Some(LOAD_POWER_W));
+        // Back to idle once generation is done.
+        assert_eq!(
+            backend.telemetry(DEVICE_ID).unwrap().npu_load_pct,
+            Some(0.0)
+        );
     }
 
     #[test]

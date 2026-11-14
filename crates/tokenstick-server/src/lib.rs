@@ -1,17 +1,24 @@
-//! OpenAI-compatible HTTP API on top of a libtokenstick [`Backend`].
+//! HTTP server on top of a libtokenstick [`Backend`].
 //!
-//! Endpoints: `GET /health`, `GET /v1/models`, `POST /v1/chat/completions`
-//! (with `stream: true` served as server-sent events).
+//! - OpenAI-compatible API: `GET /v1/models`, `POST /v1/chat/completions`
+//!   (with `stream: true` served as server-sent events)
+//! - Management API for the UI: `/api/v1/*` (see [`api`])
+//! - Embedded web UI at `/` (see [`ui`])
+//! - `GET /health`
+
+pub mod api;
+pub mod monitor;
+pub mod ui;
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::ops::ControlFlow;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use axum::extract::State;
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -26,10 +33,17 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
 
+use crate::monitor::Monitor;
+
+/// Header a caller can set to label its requests on the dashboard.
+pub const CLIENT_HEADER: &str = "x-tokenstick-client";
+
 #[derive(Clone)]
 pub struct AppState {
     backend: Arc<dyn Backend>,
     next_id: Arc<AtomicU64>,
+    monitor: Arc<Monitor>,
+    started: Instant,
 }
 
 impl AppState {
@@ -37,6 +51,8 @@ impl AppState {
         Self {
             backend,
             next_id: Arc::new(AtomicU64::new(1)),
+            monitor: Arc::new(Monitor::default()),
+            started: Instant::now(),
         }
     }
 
@@ -50,6 +66,8 @@ pub fn router(state: AppState) -> Router {
         .route("/health", get(health))
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(chat_completions))
+        .merge(api::routes())
+        .merge(ui::routes())
         .with_state(state)
 }
 
@@ -57,6 +75,7 @@ pub fn router(state: AppState) -> Router {
 pub async fn serve(backend: Arc<dyn Backend>, addr: SocketAddr) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(%addr, backend = backend.name(), "tokenstick server listening");
+    tracing::info!("web UI: http://{addr}/");
     axum::serve(listener, router(AppState::new(backend)))
         .with_graceful_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;
@@ -73,7 +92,7 @@ fn unix_now() -> u64 {
 }
 
 /// OpenAI-style error body.
-struct ApiError(StatusCode, String);
+pub(crate) struct ApiError(pub(crate) StatusCode, pub(crate) String);
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
@@ -186,28 +205,48 @@ fn finish_str(f: FinishReason) -> &'static str {
     }
 }
 
+fn client_label(headers: &HeaderMap) -> String {
+    headers
+        .get(CLIENT_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.chars().filter(|c| !c.is_control()).take(64).collect())
+        .filter(|s: &String| !s.is_empty())
+        .unwrap_or_else(|| "api".into())
+}
+
 async fn chat_completions(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(req): Json<ChatRequest>,
 ) -> Result<Response, ApiError> {
     let stream = req.stream;
+    let client = client_label(&headers);
     let gen_req = to_generation_request(req)?;
     if stream {
-        Ok(stream_completion(state, gen_req).into_response())
+        Ok(stream_completion(state, gen_req, client).into_response())
     } else {
-        Ok(full_completion(state, gen_req).await?.into_response())
+        Ok(full_completion(state, gen_req, client)
+            .await?
+            .into_response())
     }
 }
 
-async fn full_completion(state: AppState, req: GenerationRequest) -> Result<Json<Value>, ApiError> {
+async fn full_completion(
+    state: AppState,
+    req: GenerationRequest,
+    client: String,
+) -> Result<Json<Value>, ApiError> {
     let backend = state.backend.clone();
+    let monitor = state.monitor.clone();
     let model = req.model.clone();
     let (text, stats) = tokio::task::spawn_blocking(move || {
+        let _active = monitor.begin();
         let mut text = String::new();
         let stats = backend.generate(&req, &mut |t| {
             text.push_str(t);
             ControlFlow::Continue(())
         })?;
+        monitor.record(&req.model, &client, false, &stats);
         Ok::<_, BackendError>((text, stats))
     })
     .await
@@ -247,14 +286,17 @@ fn chunk(id: &str, created: u64, model: &str, delta: Value, finish: Option<&str>
 fn stream_completion(
     state: AppState,
     req: GenerationRequest,
+    client: String,
 ) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
     let id = state.completion_id();
     let created = unix_now();
     let model = req.model.clone();
     let (tx, rx) = mpsc::channel::<Event>(64);
     let backend = state.backend.clone();
+    let monitor = state.monitor.clone();
 
     tokio::task::spawn_blocking(move || {
+        let _active = monitor.begin();
         let _ = tx.blocking_send(chunk(
             &id,
             created,
@@ -271,6 +313,7 @@ fn stream_completion(
         });
         match result {
             Ok(stats) => {
+                monitor.record(&model, &client, true, &stats);
                 let _ = tx.blocking_send(chunk(
                     &id,
                     created,
@@ -362,6 +405,115 @@ mod tests {
         assert!(body.contains("chat.completion.chunk"));
         assert!(body.contains("\"finish_reason\":\"length\""));
         assert!(body.trim_end().ends_with("data: [DONE]"));
+    }
+
+    async fn get_json(app: Router, path: &str) -> Value {
+        let resp = app
+            .oneshot(Request::get(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{path}");
+        serde_json::from_str(&body_string(resp).await).unwrap()
+    }
+
+    #[tokio::test]
+    async fn info_reports_backend() {
+        let v = get_json(app(), "/api/v1/info").await;
+        assert_eq!(v["backend"], "mock");
+        assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
+    }
+
+    #[tokio::test]
+    async fn devices_include_telemetry() {
+        let v = get_json(app(), "/api/v1/devices").await;
+        let dev = &v[0];
+        assert_eq!(dev["id"], "mock0");
+        assert!(dev["telemetry"]["temperature_c"].as_f64().is_some());
+    }
+
+    #[tokio::test]
+    async fn completions_show_up_in_stats_with_client_label() {
+        let app = app();
+        let req = Request::post("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .header(CLIENT_HEADER, "playground")
+            .body(Body::from(
+                json!({
+                    "model": "qwen2.5-1.5b-instruct-w4a16",
+                    "messages": [{ "role": "user", "content": "ping" }],
+                    "max_tokens": 3
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let v = get_json(app, "/api/v1/stats").await;
+        assert_eq!(v["total_requests"], 1);
+        assert_eq!(v["active_requests"], 0);
+        assert_eq!(v["recent"][0]["client"], "playground");
+        assert_eq!(v["recent"][0]["completion_tokens"], 3);
+        assert_eq!(v["recent"][0]["finish_reason"], "length");
+    }
+
+    #[tokio::test]
+    async fn streamed_completion_is_recorded() {
+        let app = app();
+        let resp = app
+            .clone()
+            .oneshot(chat(json!({
+                "model": "qwen2.5-1.5b-instruct-w4a16",
+                "messages": [{ "role": "user", "content": "ping" }],
+                "stream": true,
+                "max_tokens": 2
+            })))
+            .await
+            .unwrap();
+        // Drain the stream so generation finishes.
+        body_string(resp).await;
+        let v = get_json(app, "/api/v1/stats").await;
+        assert_eq!(v["recent"][0]["stream"], true);
+        assert_eq!(v["recent"][0]["client"], "api");
+    }
+
+    #[tokio::test]
+    async fn serves_ui() {
+        for (path, ty) in [
+            ("/", "text/html"),
+            ("/ui/app.js", "text/javascript"),
+            ("/ui/app.css", "text/css"),
+            ("/ui/logo.svg", "image/svg+xml"),
+        ] {
+            let resp = app()
+                .oneshot(Request::get(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{path}");
+            let ct = resp.headers()[axum::http::header::CONTENT_TYPE]
+                .to_str()
+                .unwrap()
+                .to_string();
+            assert!(ct.starts_with(ty), "{path}: {ct}");
+        }
+    }
+
+    #[tokio::test]
+    async fn events_stream_sends_snapshot() {
+        let resp = app()
+            .oneshot(Request::get("/api/v1/events").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let mut body = resp.into_body();
+        let frame = tokio::time::timeout(Duration::from_secs(3), body.frame())
+            .await
+            .expect("snapshot within 3s")
+            .unwrap()
+            .unwrap();
+        let text = String::from_utf8(frame.into_data().unwrap().to_vec()).unwrap();
+        assert!(text.starts_with("event: snapshot"), "{text}");
+        assert!(text.contains("\"devices\""));
     }
 
     #[tokio::test]

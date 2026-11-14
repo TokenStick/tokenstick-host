@@ -1,0 +1,217 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TokenStick</title>
+<link rel="icon" href="/ui/logo.svg">
+<link rel="stylesheet" href="/ui/app.css">
+</head>
+<body>
+<div class="shell">
+  <nav class="nav" aria-label="Main">
+    <img class="logo" src="/ui/logo.svg" alt="TokenStick">
+    <div class="nav-links">
+      <a href="#/dashboard" data-route="dashboard">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 12h4l3-8 4 16 3-8h4"/></svg>Dashboard</a>
+      <a href="#/playground" data-route="playground">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>Playground</a>
+      <a href="#/server" data-route="server">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="7" rx="2"/><rect x="3" y="13" width="18" height="7" rx="2"/><path d="M7 7.5h.01M7 16.5h.01"/></svg>Server</a>
+      <span class="nav-soon" title="Phase 1">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 16V8l-9-5-9 5v8l9 5 9-5z"/><path d="M3.3 7 12 12l8.7-5M12 22V12"/></svg>Models<em>soon</em></span>
+      <span class="nav-soon" title="Phase 1">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 20V10M18 20V4M6 20v-4"/></svg>Benchmark<em>soon</em></span>
+    </div>
+    <div class="nav-foot">
+      <span>Backend <strong id="nav-backend" class="mono">…</strong></span>
+      <span id="nav-version">tokenstick</span>
+      <span id="nav-conn" class="conn">connecting…</span>
+    </div>
+  </nav>
+
+  <main class="main">
+    <!-- Dashboard -->
+    <section id="view-dashboard" class="view" aria-labelledby="h-dashboard">
+      <header class="page-head">
+        <div>
+          <h1 id="h-dashboard">Dashboard</h1>
+          <p class="sub"><span id="dev-count">0 devices</span> · API on <span class="mono hi" id="api-addr"></span></p>
+        </div>
+        <div class="actions">
+          <a class="btn primary" href="#/playground">Open playground</a>
+        </div>
+      </header>
+
+      <div id="devices"></div>
+
+      <section class="tiles" aria-label="Live readings">
+        <div class="card tile">
+          <span class="label">Temperature</span>
+          <span class="big mono"><span id="t-temp">–</span><small>°C</small></span>
+          <div class="bar"><div id="t-temp-bar" style="background:var(--accent)"></div></div>
+          <span class="hint">Throttle at <span id="t-throttle">85</span> °C</span>
+        </div>
+        <div class="card tile">
+          <span class="label">Power</span>
+          <span class="big mono"><span id="t-power">–</span><small>W</small></span>
+          <div class="bar"><div id="t-power-bar" style="background:var(--blue)"></div></div>
+          <span class="hint">of <span id="t-power-budget">18</span> W PD budget</span>
+        </div>
+        <div class="card tile">
+          <span class="label">NPU load</span>
+          <span class="big mono"><span id="t-npu">–</span><small>%</small></span>
+          <div class="bar"><div id="t-npu-bar" style="background:var(--text)"></div></div>
+          <span class="hint"><span id="t-active">0</span> active requests</span>
+        </div>
+        <div class="card tile">
+          <span class="label">Decode speed</span>
+          <span class="big mono accent"><span id="t-tps">–</span><small>tok/s</small></span>
+          <span class="hint">TTFT <strong class="mono" id="t-ttft">–</strong> · last request</span>
+        </div>
+      </section>
+
+      <section class="charts" aria-label="History">
+        <figure class="card chart">
+          <figcaption>Temperature &amp; power<span>last 5 min</span></figcaption>
+          <svg id="chart-thermal" viewBox="0 0 520 160" preserveAspectRatio="none" role="img" aria-label="Temperature and power over the last five minutes">
+            <path class="grid" d="M0 40H520M0 80H520M0 120H520"/>
+            <polyline id="line-temp" class="line-temp" points=""/>
+            <polyline id="line-power" class="line-power" points=""/>
+          </svg>
+          <div class="legend">
+            <span><i class="sw-temp"></i>Temperature (°C, 30–90)</span>
+            <span><i class="sw-power"></i>Power (W, 0–20)</span>
+          </div>
+        </figure>
+        <figure class="card chart">
+          <figcaption>Throughput<span>tok/s, last 12 requests</span></figcaption>
+          <svg id="chart-tps" viewBox="0 0 520 160" preserveAspectRatio="none" role="img" aria-label="Decode throughput of recent requests">
+            <path class="grid" d="M0 40H520M0 80H520M0 120H520"/>
+            <g id="tps-bars"></g>
+          </svg>
+          <div class="legend"><span id="tps-scale">No requests yet</span></div>
+        </figure>
+      </section>
+
+      <section class="card" aria-labelledby="h-recent">
+        <h2 id="h-recent" class="card-title">Recent requests</h2>
+        <div class="scroll-x">
+          <table class="table">
+            <thead><tr><th>Time</th><th>Model</th><th>Client</th><th class="r">Tokens</th><th class="r">TTFT</th><th class="r">tok/s</th><th>Finish</th></tr></thead>
+            <tbody id="recent" class="mono"></tbody>
+          </table>
+        </div>
+        <p id="recent-empty" class="empty">No requests yet. Send one from the Playground or any OpenAI client.</p>
+      </section>
+    </section>
+
+    <!-- Playground -->
+    <section id="view-playground" class="view play" aria-labelledby="h-play" hidden>
+      <div class="play-chat">
+        <header class="page-head">
+          <h1 id="h-play">Playground</h1>
+          <button type="button" class="btn" id="new-chat">New chat</button>
+        </header>
+        <div id="messages" class="messages" aria-live="polite">
+          <p class="empty" id="messages-empty">Pick a model and say hello. Replies stream from the stick.</p>
+        </div>
+        <form id="composer" class="composer">
+          <label for="msg" class="sr-only">Message</label>
+          <textarea id="msg" rows="2" placeholder="Message the model"></textarea>
+          <div class="composer-row">
+            <button type="button" class="icon-btn" disabled aria-label="Attach image (VLM models, coming with backend support)" title="VLM support comes with the pcie-vendor backend">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="m21 15-5-5L5 21"/></svg></button>
+            <button type="button" class="icon-btn" disabled aria-label="Record voice (Whisper, coming with backend support)" title="Whisper support comes with the pcie-vendor backend">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="2" width="6" height="12" rx="3"/><path d="M5 10a7 7 0 0 0 14 0M12 17v5"/></svg></button>
+            <span class="hint">Enter to send · Shift+Enter for new line</span>
+            <button type="button" class="btn" id="stop" hidden>Stop</button>
+            <button type="submit" class="btn primary" id="send">Send</button>
+          </div>
+        </form>
+      </div>
+      <aside class="play-side" aria-labelledby="h-settings">
+        <h2 id="h-settings">Settings</h2>
+        <div class="field">
+          <label for="model">Model</label>
+          <select id="model" class="mono"></select>
+        </div>
+        <div class="field">
+          <label for="system">System prompt</label>
+          <textarea id="system" rows="3" placeholder="You are a helpful assistant."></textarea>
+        </div>
+        <div class="field">
+          <div class="field-row"><label for="temperature">Temperature</label><output id="temperature-out" class="mono" for="temperature">0.70</output></div>
+          <input id="temperature" type="range" min="0" max="2" step="0.05" value="0.7">
+        </div>
+        <div class="field">
+          <div class="field-row"><label for="top_p">Top P</label><output id="top_p-out" class="mono" for="top_p">0.90</output></div>
+          <input id="top_p" type="range" min="0" max="1" step="0.05" value="0.9">
+        </div>
+        <div class="field">
+          <label for="max_tokens">Max tokens</label>
+          <input id="max_tokens" type="number" min="1" max="8192" value="256" class="mono">
+        </div>
+        <div class="mini">
+          <div><span>Temp</span><strong class="mono" id="m-temp">–</strong></div>
+          <div><span>Power</span><strong class="mono" id="m-power">–</strong></div>
+          <div><span>NPU</span><strong class="mono" id="m-npu">–</strong></div>
+          <div><span>Speed</span><strong class="mono accent" id="m-tps">–</strong></div>
+        </div>
+      </aside>
+    </section>
+
+    <!-- Server -->
+    <section id="view-server" class="view" aria-labelledby="h-server" hidden>
+      <header class="page-head">
+        <div>
+          <h1 id="h-server">Server</h1>
+          <p class="sub">Point any OpenAI client at the stick.</p>
+        </div>
+      </header>
+      <section class="endpoints">
+        <div class="card pad">
+          <div class="ep-head">
+            <div>
+              <h2>OpenAI-compatible API</h2>
+              <p class="sub">/v1/models, /v1/chat/completions (streaming)</p>
+            </div>
+            <span class="pill ok">Running</span>
+          </div>
+          <div class="url-box">
+            <span class="mono" id="openai-url"></span>
+            <button type="button" class="btn small" data-copy="openai-url">Copy</button>
+          </div>
+          <p class="hint">Works with Open WebUI, LangChain, the openai SDKs and anything that speaks the OpenAI API.</p>
+        </div>
+        <div class="card pad">
+          <div class="ep-head">
+            <div>
+              <h2>Ollama-compatible API</h2>
+              <p class="sub">/api/chat, /api/generate, /api/tags</p>
+            </div>
+            <span class="pill">Phase 2</span>
+          </div>
+          <div class="url-box dashed"><span class="mono muted">Not available yet</span></div>
+          <p class="hint">Drop-in for tools that only know Ollama.</p>
+        </div>
+      </section>
+      <section class="card pad">
+        <h2>Listen address</h2>
+        <p class="sub">Set with <code class="mono">tokenstick serve --addr</code> or <code class="mono">TOKENSTICK_ADDR</code>. Use <code class="mono">0.0.0.0:8080</code> to reach the stick from other machines.</p>
+      </section>
+      <section class="card">
+        <div class="tabs" role="tablist" aria-label="Snippet language">
+          <button type="button" role="tab" aria-selected="true" data-snippet="curl">curl</button>
+          <button type="button" role="tab" aria-selected="false" data-snippet="python">Python</button>
+          <button type="button" role="tab" aria-selected="false" data-snippet="js">JavaScript</button>
+          <button type="button" class="btn small push" data-copy="snippet">Copy</button>
+        </div>
+        <pre id="snippet" class="mono code"></pre>
+      </section>
+    </section>
+  </main>
+</div>
+<script src="/ui/app.js"></script>
+</body>
+</html>
