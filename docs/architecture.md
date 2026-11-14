@@ -43,3 +43,14 @@ Every RK182X development platform available today connects RK1828 to its host ov
 ## Phase 0 plan
 
 See the TokenStick Software Plan doc. In short: mock backend and skeletons (0a), kit bring-up (0b), benchmarks and transport research (0c), `pcie-vendor` backend and real-hardware CLI/server (0d).
+
+## Management API and web UI
+
+| Endpoint | Returns |
+| --- | --- |
+| `GET /api/v1/info` | Version, backend, uptime, queue limit |
+| `GET /api/v1/devices` | Devices with telemetry, loaded model, busy flag |
+| `GET /api/v1/stats` | Last generation (model, TTFT, tok/s), totals, pending jobs |
+| `GET /api/v1/events` | SSE `tick` event once per second with `{devices, stats}` |
+
+The web UI is one HTML file (`crates/tokenstick-server/src/ui/index.html`) compiled into the binary with `include_str!` and served at `/`. Plain HTML/JS/CSS, no Node build step, so CI and cross-compiling stay unchanged. The same page is what a Tauri tray app will wrap later. Screens today: Dashboard, Playground, Server.

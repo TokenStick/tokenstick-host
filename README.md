@@ -9,7 +9,7 @@ Host software for [TokenStick](https://github.com/TokenStick), the open-source U
 | Crate | Purpose |
 | --- | --- |
 | `libtokenstick` | Core library. Every caller reaches hardware only through the `Backend` trait. |
-| `tokenstick-server` | OpenAI-compatible HTTP API (`/v1/models`, `/v1/chat/completions` with streaming) plus `/v1/tokenstick/status`. Queues requests per device. |
+| `tokenstick-server` | OpenAI-compatible HTTP API (`/v1/models`, `/v1/chat/completions` with streaming), management API (`/api/v1/*`) and the embedded web UI at `/`. Queues requests per device. |
 | `tokenstick-cli` | The `tokenstick` binary: `status`, `models`, `run`, `bench`, `serve`. |
 
 Models are loaded on demand: the first request for a model loads it onto a device (seconds on real hardware), later requests reuse it. Each device runs one job at a time; the server queues requests in FIFO order and answers `503` when more than 8 jobs are pending.
@@ -34,7 +34,9 @@ cargo build --release
 ./target/release/tokenstick serve --addr 127.0.0.1:8080
 ```
 
-Then point any OpenAI client at `http://127.0.0.1:8080/v1`:
+Open `http://127.0.0.1:8080/` for the web UI: a live Dashboard (devices, temperature, power, NPU load, tok/s, TTFT, queue), a streaming chat Playground and copyable client snippets. On a headless host (the RK3576 kit, a Pi) open it from another machine's browser after `serve --addr 0.0.0.0:8080`.
+
+Or point any OpenAI client at `http://127.0.0.1:8080/v1`:
 
 ```sh
 curl -N http://127.0.0.1:8080/v1/chat/completions \

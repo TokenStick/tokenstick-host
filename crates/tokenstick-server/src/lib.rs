@@ -34,6 +34,8 @@ use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
 
+mod management;
+
 /// Default limit for running + queued jobs across all devices.
 pub const DEFAULT_MAX_PENDING: usize = 8;
 
@@ -44,6 +46,7 @@ pub struct AppState {
     queues: Arc<Mutex<HashMap<String, Arc<Semaphore>>>>,
     pending: Arc<AtomicUsize>,
     max_pending: usize,
+    metrics: Arc<management::Metrics>,
 }
 
 impl AppState {
@@ -54,6 +57,7 @@ impl AppState {
             queues: Arc::new(Mutex::new(HashMap::new())),
             pending: Arc::new(AtomicUsize::new(0)),
             max_pending: DEFAULT_MAX_PENDING,
+            metrics: Arc::new(management::Metrics::default()),
         }
     }
 
@@ -161,6 +165,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/tokenstick/status", get(status))
+        .merge(management::routes())
         .with_state(state)
 }
 
@@ -236,32 +241,7 @@ async fn list_models(State(state): State<AppState>) -> Result<Json<Value>, ApiEr
 }
 
 async fn status(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
-    let backend = state.backend.clone();
-    let devices = tokio::task::spawn_blocking(move || {
-        backend
-            .devices()?
-            .into_iter()
-            .map(|d| {
-                let telemetry = backend.telemetry(&d.id)?;
-                let loaded = backend.loaded_model(&d.id)?;
-                Ok((d, telemetry, loaded))
-            })
-            .collect::<libtokenstick::Result<Vec<_>>>()
-    })
-    .await
-    .map_err(join_error)??;
-
-    let devices: Vec<Value> = devices
-        .into_iter()
-        .map(|(d, t, loaded)| {
-            json!({
-                "busy": state.is_busy(&d.id),
-                "loaded_model": loaded,
-                "telemetry": t,
-                "device": d,
-            })
-        })
-        .collect();
+    let devices = management::device_snapshot(&state).await?;
     Ok(Json(json!({
         "backend": state.backend.name(),
         "pending": state.pending.load(Ordering::Acquire),
@@ -434,6 +414,7 @@ async fn full_completion(
     })
     .await
     .map_err(join_error)??;
+    state.metrics.record(&model, &stats);
 
     Ok(Json(json!({
         "id": state.completion_id(),
@@ -476,6 +457,7 @@ fn stream_completion(
     let model = req.model.clone();
     let (tx, rx) = mpsc::channel::<Event>(64);
     let backend = state.backend.clone();
+    let metrics = state.metrics.clone();
 
     tokio::spawn(async move {
         let slot = admission.wait_turn().await;
@@ -499,6 +481,7 @@ fn stream_completion(
             });
             match result {
                 Ok(stats) => {
+                    metrics.record(&model, &stats);
                     let _ = tx.blocking_send(chunk(
                         &id,
                         created,
@@ -693,6 +676,55 @@ mod tests {
         assert_eq!(v["devices"][0]["loaded_model"], MODEL);
         assert_eq!(v["devices"][0]["busy"], false);
         assert_eq!(v["pending"], 0);
+    }
+
+    async fn get_json(router: &Router, path: &str) -> Value {
+        let resp = router
+            .clone()
+            .oneshot(Request::get(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{path}");
+        body_json(resp).await
+    }
+
+    #[tokio::test]
+    async fn management_api_tracks_generations() {
+        let router = router(state(Duration::ZERO));
+        let info = get_json(&router, "/api/v1/info").await;
+        assert_eq!(info["backend"], "mock");
+
+        let before = get_json(&router, "/api/v1/stats").await;
+        assert_eq!(before["total_requests"], 0);
+        assert!(before["last"].is_null());
+
+        for stream in [false, true] {
+            let resp = router
+                .clone()
+                .oneshot(chat(simple(stream, 3)))
+                .await
+                .unwrap();
+            drop(body_string(resp).await);
+        }
+        let after = get_json(&router, "/api/v1/stats").await;
+        assert_eq!(after["total_requests"], 2);
+        assert_eq!(after["total_completion_tokens"], 6);
+        assert_eq!(after["last"]["model"], MODEL);
+
+        let devices = get_json(&router, "/api/v1/devices").await;
+        assert_eq!(devices["devices"][0]["loaded_model"], MODEL);
+    }
+
+    #[tokio::test]
+    async fn serves_web_ui() {
+        let resp = app()
+            .oneshot(Request::get("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(body_string(resp)
+            .await
+            .contains("<title>TokenStick</title>"));
     }
 
     /// Minimal join_all so tests need no extra dependency.
