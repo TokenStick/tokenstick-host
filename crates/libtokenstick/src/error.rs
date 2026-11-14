@@ -7,6 +7,13 @@ pub enum Error {
     #[error("model not found: {0}")]
     ModelNotFound(String),
 
+    #[error("model '{model}' is not loaded on device '{device}'")]
+    ModelNotLoaded { device: String, model: String },
+
+    /// The device is already running a job. Callers must serialize work per device.
+    #[error("device busy: {0}")]
+    Busy(String),
+
     #[error("invalid request: {0}")]
     InvalidRequest(String),
 

@@ -9,8 +9,10 @@ Host software for [TokenStick](https://github.com/TokenStick), the open-source U
 | Crate | Purpose |
 | --- | --- |
 | `libtokenstick` | Core library. Every caller reaches hardware only through the `Backend` trait. |
-| `tokenstick-server` | OpenAI-compatible HTTP API (`/v1/models`, `/v1/chat/completions` with streaming). |
+| `tokenstick-server` | OpenAI-compatible HTTP API (`/v1/models`, `/v1/chat/completions` with streaming) plus `/v1/tokenstick/status`. Queues requests per device. |
 | `tokenstick-cli` | The `tokenstick` binary: `status`, `models`, `run`, `bench`, `serve`. |
+
+Models are loaded on demand: the first request for a model loads it onto a device (seconds on real hardware), later requests reuse it. Each device runs one job at a time; the server queues requests in FIFO order and answers `503` when more than 8 jobs are pending.
 
 Backends:
 
@@ -45,8 +47,10 @@ Environment variables:
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `TOKENSTICK_BACKEND` | `mock` | Backend to open |
+| `TOKENSTICK_DEVICE` | auto | Device id for `run` / `bench` |
 | `TOKENSTICK_ADDR` | `127.0.0.1:8080` | Server listen address |
 | `TOKENSTICK_MOCK_DELAY_MS` | `25` | Per-token delay of the mock backend |
+| `TOKENSTICK_MOCK_LOAD_MS` | `300` | Model load time of the mock backend |
 | `RUST_LOG` | `info` | Log filter |
 
 ## Cross-compiling for the dev kit

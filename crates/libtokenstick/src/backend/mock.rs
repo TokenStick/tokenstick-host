@@ -1,11 +1,13 @@
 //! Hardware-free backend for development and CI.
 //!
 //! Streams a deterministic reply word by word with a configurable per-token
-//! delay, and reports telemetry that moves with load, so the CLI, server and
-//! benchmark harness can be built before the kit arrives.
+//! delay, simulates model load time, reports telemetry that moves with load,
+//! and returns [`Error::Busy`] if a caller breaks the one-job-per-device rule,
+//! so the CLI, server and benchmark harness can be built before the kit arrives.
 
 use std::ops::ControlFlow;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use super::{Backend, TokenSink};
@@ -15,29 +17,72 @@ use crate::{
 };
 
 const DEVICE_ID: &str = "mock0";
-const DEFAULT_DELAY: Duration = Duration::from_millis(25);
+const DEFAULT_TOKEN_DELAY: Duration = Duration::from_millis(25);
+const DEFAULT_LOAD_DELAY: Duration = Duration::from_millis(300);
 
 pub struct MockBackend {
     token_delay: Duration,
+    load_delay: Duration,
+    loaded: Mutex<Option<String>>,
+    busy: AtomicBool,
     tokens_generated: AtomicU64,
 }
 
+/// Marks the device busy for the lifetime of a job.
+struct BusyGuard<'a>(&'a AtomicBool);
+
+impl<'a> BusyGuard<'a> {
+    fn acquire(flag: &'a AtomicBool) -> Result<Self> {
+        if flag.swap(true, Ordering::AcqRel) {
+            return Err(Error::Busy(DEVICE_ID.into()));
+        }
+        Ok(Self(flag))
+    }
+}
+
+impl Drop for BusyGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+fn env_ms(var: &str) -> Option<Duration> {
+    std::env::var(var)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .map(Duration::from_millis)
+}
+
 impl MockBackend {
-    /// Per-token delay defaults to 25 ms and can be overridden with
-    /// `TOKENSTICK_MOCK_DELAY_MS`.
+    /// Delays default to 25 ms per token and 300 ms per model load, overridable
+    /// with `TOKENSTICK_MOCK_DELAY_MS` and `TOKENSTICK_MOCK_LOAD_MS`.
     pub fn new() -> Self {
-        let delay = std::env::var("TOKENSTICK_MOCK_DELAY_MS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .map(Duration::from_millis)
-            .unwrap_or(DEFAULT_DELAY);
-        Self::with_delay(delay)
+        Self::with_delays(
+            env_ms("TOKENSTICK_MOCK_DELAY_MS").unwrap_or(DEFAULT_TOKEN_DELAY),
+            env_ms("TOKENSTICK_MOCK_LOAD_MS").unwrap_or(DEFAULT_LOAD_DELAY),
+        )
     }
 
+    /// Same delay per token; model load takes 10x that.
     pub fn with_delay(token_delay: Duration) -> Self {
+        Self::with_delays(token_delay, token_delay * 10)
+    }
+
+    pub fn with_delays(token_delay: Duration, load_delay: Duration) -> Self {
         Self {
             token_delay,
+            load_delay,
+            loaded: Mutex::new(None),
+            busy: AtomicBool::new(false),
             tokens_generated: AtomicU64::new(0),
+        }
+    }
+
+    fn check_device(device_id: &str) -> Result<()> {
+        if device_id == DEVICE_ID {
+            Ok(())
+        } else {
+            Err(Error::DeviceNotFound(device_id.into()))
         }
     }
 
@@ -65,29 +110,20 @@ impl Default for MockBackend {
 }
 
 fn mock_models() -> Vec<ModelInfo> {
-    vec![
-        ModelInfo {
-            id: "qwen2.5-1.5b-instruct-w4a16".into(),
-            family: "qwen2.5".into(),
-            params_b: 1.5,
-            quantization: "w4a16".into(),
-            context_len: 4096,
-        },
-        ModelInfo {
-            id: "qwen2.5-3b-instruct-w4a16".into(),
-            family: "qwen2.5".into(),
-            params_b: 3.0,
-            quantization: "w4a16".into(),
-            context_len: 4096,
-        },
-        ModelInfo {
-            id: "qwen2.5-7b-instruct-w4a16".into(),
-            family: "qwen2.5".into(),
-            params_b: 7.0,
-            quantization: "w4a16".into(),
-            context_len: 4096,
-        },
+    [
+        ("qwen2.5-1.5b-instruct-w4a16", 1.5),
+        ("qwen2.5-3b-instruct-w4a16", 3.0),
+        ("qwen2.5-7b-instruct-w4a16", 7.0),
     ]
+    .into_iter()
+    .map(|(id, params_b)| ModelInfo {
+        id: id.into(),
+        family: "qwen2.5".into(),
+        params_b,
+        quantization: "w4a16".into(),
+        context_len: 4096,
+    })
+    .collect()
 }
 
 fn approx_tokens(text: &str) -> u32 {
@@ -110,15 +146,14 @@ impl Backend for MockBackend {
     }
 
     fn telemetry(&self, device_id: &str) -> Result<Telemetry> {
-        if device_id != DEVICE_ID {
-            return Err(Error::DeviceNotFound(device_id.into()));
-        }
+        Self::check_device(device_id)?;
         // Warm up slowly with generated tokens, capped like a real thermal limit.
         let load = self.tokens_generated.load(Ordering::Relaxed) as f32;
+        let busy = self.busy.load(Ordering::Relaxed);
         Ok(Telemetry {
             temperature_c: Some((42.0 + load / 200.0).min(88.0)),
-            power_w: Some(2.5),
-            npu_load_pct: Some(0.0),
+            power_w: Some(if busy { 9.5 } else { 2.5 }),
+            npu_load_pct: Some(if busy { 85.0 } else { 0.0 }),
             pd_contract: None,
         })
     }
@@ -127,17 +162,49 @@ impl Backend for MockBackend {
         Ok(mock_models())
     }
 
+    fn loaded_model(&self, device_id: &str) -> Result<Option<String>> {
+        Self::check_device(device_id)?;
+        Ok(self.loaded.lock().expect("mock state poisoned").clone())
+    }
+
+    fn load_model(&self, device_id: &str, model_id: &str) -> Result<()> {
+        Self::check_device(device_id)?;
+        if !mock_models().iter().any(|m| m.id == model_id) {
+            return Err(Error::ModelNotFound(model_id.into()));
+        }
+        let _busy = BusyGuard::acquire(&self.busy)?;
+        std::thread::sleep(self.load_delay);
+        *self.loaded.lock().expect("mock state poisoned") = Some(model_id.into());
+        Ok(())
+    }
+
+    fn unload_model(&self, device_id: &str) -> Result<()> {
+        Self::check_device(device_id)?;
+        let _busy = BusyGuard::acquire(&self.busy)?;
+        *self.loaded.lock().expect("mock state poisoned") = None;
+        Ok(())
+    }
+
     fn generate(
         &self,
+        device_id: &str,
         req: &GenerationRequest,
         sink: &mut TokenSink<'_>,
     ) -> Result<GenerationStats> {
+        Self::check_device(device_id)?;
         if !mock_models().iter().any(|m| m.id == req.model) {
             return Err(Error::ModelNotFound(req.model.clone()));
+        }
+        if self.loaded_model(device_id)?.as_deref() != Some(req.model.as_str()) {
+            return Err(Error::ModelNotLoaded {
+                device: device_id.into(),
+                model: req.model.clone(),
+            });
         }
         if req.messages.is_empty() {
             return Err(Error::InvalidRequest("messages must not be empty".into()));
         }
+        let _busy = BusyGuard::acquire(&self.busy)?;
 
         let prompt_tokens = req.messages.iter().map(|m| approx_tokens(&m.content)).sum();
         let reply = Self::reply_for(req);
@@ -161,7 +228,6 @@ impl Backend for MockBackend {
                 .iter()
                 .any(|s| !s.is_empty() && text.contains(s.as_str()))
             {
-                finish = FinishReason::Stop;
                 break;
             }
             first_token_at.get_or_insert_with(Instant::now);
@@ -197,9 +263,17 @@ mod tests {
     use super::*;
     use crate::{GenerationParams, Message};
 
+    const MODEL: &str = "qwen2.5-1.5b-instruct-w4a16";
+
+    fn backend() -> MockBackend {
+        let b = MockBackend::with_delay(Duration::ZERO);
+        b.load_model(DEVICE_ID, MODEL).unwrap();
+        b
+    }
+
     fn request(max_tokens: u32) -> GenerationRequest {
         GenerationRequest {
-            model: "qwen2.5-1.5b-instruct-w4a16".into(),
+            model: MODEL.into(),
             messages: vec![Message::new(Role::User, "hello stick")],
             params: GenerationParams {
                 max_tokens,
@@ -208,12 +282,16 @@ mod tests {
         }
     }
 
+    fn run(b: &MockBackend, req: &GenerationRequest) -> Result<GenerationStats> {
+        b.generate(DEVICE_ID, req, &mut |_| ControlFlow::Continue(()))
+    }
+
     #[test]
     fn streams_reply_containing_prompt() {
-        let backend = MockBackend::with_delay(Duration::ZERO);
+        let b = backend();
         let mut out = String::new();
-        let stats = backend
-            .generate(&request(256), &mut |t| {
+        let stats = b
+            .generate(DEVICE_ID, &request(256), &mut |t| {
                 out.push_str(t);
                 ControlFlow::Continue(())
             })
@@ -225,32 +303,51 @@ mod tests {
 
     #[test]
     fn respects_max_tokens() {
-        let backend = MockBackend::with_delay(Duration::ZERO);
-        let stats = backend
-            .generate(&request(3), &mut |_| ControlFlow::Continue(()))
-            .unwrap();
+        let stats = run(&backend(), &request(3)).unwrap();
         assert_eq!(stats.completion_tokens, 3);
         assert_eq!(stats.finish_reason, FinishReason::Length);
     }
 
     #[test]
     fn sink_can_cancel() {
-        let backend = MockBackend::with_delay(Duration::ZERO);
-        let stats = backend
-            .generate(&request(256), &mut |_| ControlFlow::Break(()))
+        let stats = backend()
+            .generate(DEVICE_ID, &request(256), &mut |_| ControlFlow::Break(()))
             .unwrap();
         assert_eq!(stats.completion_tokens, 1);
         assert_eq!(stats.finish_reason, FinishReason::Cancelled);
     }
 
     #[test]
-    fn unknown_model_is_rejected() {
-        let backend = MockBackend::with_delay(Duration::ZERO);
+    fn requires_loaded_model() {
+        let b = MockBackend::with_delay(Duration::ZERO);
+        assert!(matches!(
+            run(&b, &request(8)),
+            Err(Error::ModelNotLoaded { .. })
+        ));
+        b.load_model(DEVICE_ID, MODEL).unwrap();
+        assert!(run(&b, &request(8)).is_ok());
+        b.unload_model(DEVICE_ID).unwrap();
+        assert_eq!(b.loaded_model(DEVICE_ID).unwrap(), None);
+    }
+
+    #[test]
+    fn rejects_concurrent_jobs() {
+        let b = backend();
+        let mut nested = None;
+        b.generate(DEVICE_ID, &request(2), &mut |_| {
+            nested.get_or_insert_with(|| run(&b, &request(1)).map(|_| ()));
+            ControlFlow::Continue(())
+        })
+        .unwrap();
+        assert!(matches!(nested, Some(Err(Error::Busy(_)))));
+    }
+
+    #[test]
+    fn unknown_model_and_device_are_rejected() {
+        let b = backend();
         let mut req = request(8);
         req.model = "nope".into();
-        let err = backend
-            .generate(&req, &mut |_| ControlFlow::Continue(()))
-            .unwrap_err();
-        assert!(matches!(err, Error::ModelNotFound(_)));
+        assert!(matches!(run(&b, &req), Err(Error::ModelNotFound(_))));
+        assert!(matches!(b.telemetry("x"), Err(Error::DeviceNotFound(_))));
     }
 }
