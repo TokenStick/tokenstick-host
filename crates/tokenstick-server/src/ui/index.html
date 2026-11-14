@@ -164,7 +164,7 @@ function renderDevices(devices) {
         <div><div class="id">${esc(dev.id)}</div><div class="meta">${esc(dev.chip)} · ${dev.memory_mib} MiB · fw ${esc(dev.firmware || "-")}</div></div>
         <span class="state ${d.busy ? "busy" : "idle"}">${d.busy ? "busy" : "idle"}</span>
       </div>
-      <div class="meta" style="margin-bottom:12px">Model: <code>${esc(d.loaded_model || "none loaded")}</code></div>
+      <div class="meta" style="margin-bottom:12px">Model: <code>${esc(d.loaded_model || "none loaded")}</code> · Power mode: <code>${esc(d.power_mode || "-")}</code></div>
       <div class="grid">
         <div class="tile"><div class="label">Temperature</div><div class="value ${tempClass(t.temperature_c)}">${fmt(t.temperature_c)}<small>°C</small></div></div>
         <div class="tile"><div class="label">Power</div><div class="value">${fmt(t.power_w)}<small>W</small></div></div>

@@ -55,6 +55,19 @@ Environment variables:
 | `TOKENSTICK_MOCK_LOAD_MS` | `300` | Model load time of the mock backend |
 | `RUST_LOG` | `info` | Log filter |
 
+## Installing on a Linux host (dev kit, Pi, server)
+
+Each tagged release ships x86_64 and aarch64 tarballs with the binary, a systemd unit and an installer:
+
+```sh
+curl -fsSLO https://raw.githubusercontent.com/TokenStick/tokenstick-host/main/scripts/install.sh
+sudo sh install.sh --version v0.1.0
+```
+
+This installs `/usr/local/bin/tokenstick`, enables `tokenstick.service` (config in `/etc/default/tokenstick`, models in `/var/lib/tokenstick/models`) and starts it. `sudo sh install.sh --uninstall` removes it.
+
+Other commands: `tokenstick power [low-power|balanced|performance]` shows or sets the NPU power mode; `tokenstick store list` checks the local model store.
+
 ## Cross-compiling for the dev kit
 
 The Phase 0 host is an RK3576 board (aarch64 Debian):
@@ -68,6 +81,8 @@ CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
 
 ## Docs
 
+- [Contributing](CONTRIBUTING.md): branch model (`main` / `development` / `feature/*`), versioning, release process
+- [Changelog](CHANGELOG.md)
 - [Architecture](docs/architecture.md)
 - [RKNN3 runtime mapping](docs/rknn3-mapping.md): plan for the `pcie-vendor` backend
 

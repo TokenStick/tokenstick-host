@@ -12,8 +12,8 @@ use std::time::{Duration, Instant};
 
 use super::{Backend, TokenSink};
 use crate::{
-    DeviceInfo, Error, FinishReason, GenerationRequest, GenerationStats, ModelInfo, Result, Role,
-    Telemetry,
+    DeviceInfo, Error, FinishReason, GenerationRequest, GenerationStats, ModelInfo, PowerMode,
+    Result, Role, Telemetry,
 };
 
 const DEVICE_ID: &str = "mock0";
@@ -24,6 +24,7 @@ pub struct MockBackend {
     token_delay: Duration,
     load_delay: Duration,
     loaded: Mutex<Option<String>>,
+    power: Mutex<PowerMode>,
     busy: AtomicBool,
     tokens_generated: AtomicU64,
 }
@@ -73,6 +74,7 @@ impl MockBackend {
             token_delay,
             load_delay,
             loaded: Mutex::new(None),
+            power: Mutex::new(PowerMode::Balanced),
             busy: AtomicBool::new(false),
             tokens_generated: AtomicU64::new(0),
         }
@@ -109,21 +111,26 @@ impl Default for MockBackend {
     }
 }
 
+/// Qwen2.5 family: id, params (B), hidden size. Vocab is 151,936 for all three.
+const MOCK_MODELS: [(&str, f32, u64); 3] = [
+    ("qwen2.5-1.5b-instruct-w4a16", 1.5, 1536),
+    ("qwen2.5-3b-instruct-w4a16", 3.0, 2048),
+    ("qwen2.5-7b-instruct-w4a16", 7.0, 3584),
+];
+
 fn mock_models() -> Vec<ModelInfo> {
-    [
-        ("qwen2.5-1.5b-instruct-w4a16", 1.5),
-        ("qwen2.5-3b-instruct-w4a16", 3.0),
-        ("qwen2.5-7b-instruct-w4a16", 7.0),
-    ]
-    .into_iter()
-    .map(|(id, params_b)| ModelInfo {
-        id: id.into(),
-        family: "qwen2.5".into(),
-        params_b,
-        quantization: "w4a16".into(),
-        context_len: 4096,
-    })
-    .collect()
+    MOCK_MODELS
+        .into_iter()
+        .map(|(id, params_b, hidden)| ModelInfo {
+            id: id.into(),
+            family: "qwen2.5".into(),
+            params_b,
+            quantization: "w4a16".into(),
+            context_len: 4096,
+            // FP16 embedding table kept on the host: vocab x hidden x 2 bytes.
+            host_mem_mib: Some((151_936 * hidden * 2 / (1024 * 1024)) as u32),
+        })
+        .collect()
 }
 
 fn approx_tokens(text: &str) -> u32 {
@@ -185,6 +192,17 @@ impl Backend for MockBackend {
         Ok(())
     }
 
+    fn power_mode(&self, device_id: &str) -> Result<PowerMode> {
+        Self::check_device(device_id)?;
+        Ok(*self.power.lock().expect("mock state poisoned"))
+    }
+
+    fn set_power_mode(&self, device_id: &str, mode: PowerMode) -> Result<()> {
+        Self::check_device(device_id)?;
+        *self.power.lock().expect("mock state poisoned") = mode;
+        Ok(())
+    }
+
     fn generate(
         &self,
         device_id: &str,
@@ -208,6 +226,12 @@ impl Backend for MockBackend {
 
         let prompt_tokens = req.messages.iter().map(|m| approx_tokens(&m.content)).sum();
         let reply = Self::reply_for(req);
+        // Rough shape of the real modes: low power is slower, performance faster.
+        let token_delay = match *self.power.lock().expect("mock state poisoned") {
+            PowerMode::LowPower => self.token_delay * 2,
+            PowerMode::Balanced => self.token_delay,
+            PowerMode::Performance => self.token_delay * 7 / 10,
+        };
 
         let start = Instant::now();
         let mut first_token_at = None;
@@ -220,7 +244,7 @@ impl Backend for MockBackend {
                 finish = FinishReason::Length;
                 break;
             }
-            std::thread::sleep(self.token_delay);
+            std::thread::sleep(token_delay);
             text.push_str(piece);
             if req
                 .params
@@ -340,6 +364,17 @@ mod tests {
         })
         .unwrap();
         assert!(matches!(nested, Some(Err(Error::Busy(_)))));
+    }
+
+    #[test]
+    fn power_mode_round_trip_and_host_mem() {
+        let b = backend();
+        assert_eq!(b.power_mode(DEVICE_ID).unwrap(), PowerMode::Balanced);
+        b.set_power_mode(DEVICE_ID, PowerMode::Performance).unwrap();
+        assert_eq!(b.power_mode(DEVICE_ID).unwrap(), PowerMode::Performance);
+        let seven_b = b.models().unwrap().into_iter().last().unwrap();
+        assert_eq!(seven_b.host_mem_mib, Some(1038));
+        assert_eq!("2".parse::<PowerMode>().unwrap(), PowerMode::Performance);
     }
 
     #[test]

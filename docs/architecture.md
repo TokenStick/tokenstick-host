@@ -24,6 +24,7 @@
 | `models()` | Models the backend can run (`ModelInfo`) |
 | `loaded_model(device)` | Model resident on the device, if any |
 | `load_model(device, model)` / `unload_model(device)` | Move a model onto / off the device (seconds for 7B) |
+| `power_mode(device)` / `set_power_mode(device, mode)` | NPU power profile (RKNN3 `work_mode` 0/1/2); default impl reports `balanced` and refuses changes |
 | `generate(device, req, sink)` | Streams text pieces into `sink`, returns `GenerationStats` (TTFT, tok/s, finish reason) |
 
 Contract:
@@ -54,3 +55,7 @@ See the TokenStick Software Plan doc. In short: mock backend and skeletons (0a),
 | `GET /api/v1/events` | SSE `tick` event once per second with `{devices, stats}` |
 
 The web UI is one HTML file (`crates/tokenstick-server/src/ui/index.html`) compiled into the binary with `include_str!` and served at `/`. Plain HTML/JS/CSS, no Node build step, so CI and cross-compiling stay unchanged. The same page is what a Tauri tray app will wrap later. Screens today: Dashboard, Playground, Server.
+
+## Model store
+
+`libtokenstick::model_store` reads converted models from `$TOKENSTICK_MODELS_DIR` (service default `/var/lib/tokenstick/models`, user default `~/.local/share/tokenstick/models`). One directory per model with a `manifest.json` listing the RKNN3 file set; `tokenstick store list` shows which models are complete. The `pcie-vendor` backend will build `models()` from this store.

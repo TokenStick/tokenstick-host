@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 pub mod backend;
 mod error;
+pub mod model_store;
 mod types;
 
 pub use backend::{Backend, BackendKind, TokenSink};

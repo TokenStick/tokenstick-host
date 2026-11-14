@@ -74,7 +74,7 @@ Phase 0: clear the KV cache on every request and send the full message list (sim
 
 ## Trait changes this implies
 
-Not urgent, noted so they land before 0d:
+Items 1 and 3 landed in v0.1.0 (`power_mode` / `set_power_mode`, `ModelInfo::host_mem_mib`, model store); item 2 stays internal:
 
 1. **Power mode:** `rknn-smi set -t work_mode` 0/1/2. Add `set_power_mode(device, mode)` and expose it in CLI/server; benchmarks must record the mode (vendor numbers are in performance mode).
 2. **Core mask:** `core_mask` selects NPU cores (e.g. `0xff`). Keep internal for now, default to all cores.

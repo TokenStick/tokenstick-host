@@ -1,0 +1,11 @@
+# /etc/default/tokenstick: environment for tokenstick.service
+
+# Backend: mock, pcie-vendor (RK1828 over PCIe, RKNN3 runtime) or usb (TokenStick).
+TOKENSTICK_BACKEND=mock
+
+# Listen address. Use 0.0.0.0:8080 to open the web UI from other machines.
+# The API has no authentication yet: only do this on a trusted network.
+TOKENSTICK_ADDR=127.0.0.1:8080
+
+# Log level: error, warn, info, debug, trace
+RUST_LOG=info
