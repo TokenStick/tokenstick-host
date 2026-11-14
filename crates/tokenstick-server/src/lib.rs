@@ -1,10 +1,10 @@
-//! OpenAI-compatible HTTP API on top of a libtokenstick [`Backend`].
+//! HTTP server on top of a libtokenstick [`Backend`].
 //!
-//! Endpoints:
+//! - OpenAI-compatible API: `GET /v1/models`, `POST /v1/chat/completions`
+//!   (`stream: true` served as server-sent events)
+//! - Management API for the UI: `/api/v1/*` (see [`api`]), plus `GET /v1/tokenstick/status`
+//! - Embedded web UI at `/` (see [`ui`])
 //! - `GET /health`
-//! - `GET /v1/models`
-//! - `POST /v1/chat/completions` (`stream: true` served as server-sent events)
-//! - `GET /v1/tokenstick/status` (devices, loaded models, telemetry, queue)
 //!
 //! A device runs one job at a time, so requests wait in a FIFO queue per
 //! device. When more than `max_pending` jobs are running or waiting, new
@@ -16,10 +16,10 @@ use std::net::SocketAddr;
 use std::ops::ControlFlow;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use axum::extract::State;
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -34,7 +34,14 @@ use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
 
-mod management;
+pub mod api;
+pub mod monitor;
+pub mod ui;
+
+use crate::monitor::Monitor;
+
+/// Header a caller can set to label its requests on the dashboard.
+pub const CLIENT_HEADER: &str = "x-tokenstick-client";
 
 /// Default limit for running + queued jobs across all devices.
 pub const DEFAULT_MAX_PENDING: usize = 8;
@@ -46,7 +53,8 @@ pub struct AppState {
     queues: Arc<Mutex<HashMap<String, Arc<Semaphore>>>>,
     pending: Arc<AtomicUsize>,
     max_pending: usize,
-    metrics: Arc<management::Metrics>,
+    monitor: Arc<Monitor>,
+    started: Instant,
 }
 
 impl AppState {
@@ -57,7 +65,8 @@ impl AppState {
             queues: Arc::new(Mutex::new(HashMap::new())),
             pending: Arc::new(AtomicUsize::new(0)),
             max_pending: DEFAULT_MAX_PENDING,
-            metrics: Arc::new(management::Metrics::default()),
+            monitor: Arc::new(Monitor::default()),
+            started: Instant::now(),
         }
     }
 
@@ -165,7 +174,8 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/tokenstick/status", get(status))
-        .merge(management::routes())
+        .merge(api::routes())
+        .merge(ui::routes())
         .with_state(state)
 }
 
@@ -173,6 +183,7 @@ pub fn router(state: AppState) -> Router {
 pub async fn serve(backend: Arc<dyn Backend>, addr: SocketAddr) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(%addr, backend = backend.name(), "tokenstick server listening");
+    tracing::info!("web UI: http://{addr}/");
     axum::serve(listener, router(AppState::new(backend)))
         .with_graceful_shutdown(shutdown_signal())
         .await?;
@@ -210,7 +221,7 @@ fn unix_now() -> u64 {
 }
 
 /// OpenAI-style error body.
-struct ApiError(StatusCode, String);
+pub(crate) struct ApiError(pub(crate) StatusCode, pub(crate) String);
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
@@ -262,7 +273,7 @@ async fn list_models(State(state): State<AppState>) -> Result<Json<Value>, ApiEr
 }
 
 async fn status(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
-    let devices = management::device_snapshot(&state).await?;
+    let devices = api::read_devices(&state).await?;
     Ok(Json(json!({
         "backend": state.backend.name(),
         "pending": state.pending.load(Ordering::Acquire),
@@ -399,19 +410,30 @@ fn finish_str(f: FinishReason) -> &'static str {
     }
 }
 
+fn client_label(headers: &HeaderMap) -> String {
+    headers
+        .get(CLIENT_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.chars().filter(|c| !c.is_control()).take(64).collect())
+        .filter(|s: &String| !s.is_empty())
+        .unwrap_or_else(|| "api".into())
+}
+
 async fn chat_completions(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(req): Json<ChatRequest>,
 ) -> Result<Response, ApiError> {
     let stream = req.stream;
+    let client = client_label(&headers);
     let gen_req = to_generation_request(req)?;
     // Admission happens before any response is sent, so an unknown model is a
     // 404 and a full queue is a 503 for streaming requests too.
     let admission = state.admit(&gen_req.model)?;
     if stream {
-        Ok(stream_completion(state, gen_req, admission).into_response())
+        Ok(stream_completion(state, gen_req, admission, client).into_response())
     } else {
-        Ok(full_completion(state, gen_req, admission)
+        Ok(full_completion(state, gen_req, admission, client)
             .await?
             .into_response())
     }
@@ -421,21 +443,24 @@ async fn full_completion(
     state: AppState,
     req: GenerationRequest,
     admission: Admission,
+    client: String,
 ) -> Result<Json<Value>, ApiError> {
     let slot = admission.wait_turn().await;
     let backend = state.backend.clone();
+    let monitor = state.monitor.clone();
     let model = req.model.clone();
     let (text, stats) = tokio::task::spawn_blocking(move || {
+        let _active = monitor.begin();
         let mut text = String::new();
         let stats = run_on_device(backend.as_ref(), &slot, &req, &mut |t| {
             text.push_str(t);
             ControlFlow::Continue(())
         })?;
+        monitor.record(&req.model, &client, false, &stats);
         Ok::<_, BackendError>((text, stats))
     })
     .await
     .map_err(join_error)??;
-    state.metrics.record(&model, &stats);
 
     Ok(Json(json!({
         "id": state.completion_id(),
@@ -472,13 +497,14 @@ fn stream_completion(
     state: AppState,
     req: GenerationRequest,
     admission: Admission,
+    client: String,
 ) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
     let id = state.completion_id();
     let created = unix_now();
     let model = req.model.clone();
     let (tx, rx) = mpsc::channel::<Event>(64);
     let backend = state.backend.clone();
-    let metrics = state.metrics.clone();
+    let monitor = state.monitor.clone();
 
     tokio::spawn(async move {
         let slot = admission.wait_turn().await;
@@ -486,6 +512,7 @@ fn stream_completion(
             return; // client left while queued
         }
         let _ = tokio::task::spawn_blocking(move || {
+            let _active = monitor.begin();
             let _ = tx.blocking_send(chunk(
                 &id,
                 created,
@@ -502,7 +529,7 @@ fn stream_completion(
             });
             match result {
                 Ok(stats) => {
-                    metrics.record(&model, &stats);
+                    monitor.record(&model, &client, true, &stats);
                     let _ = tx.blocking_send(chunk(
                         &id,
                         created,
@@ -714,10 +741,11 @@ mod tests {
         let router = router(state(Duration::ZERO));
         let info = get_json(&router, "/api/v1/info").await;
         assert_eq!(info["backend"], "mock");
+        assert_eq!(info["version"], env!("CARGO_PKG_VERSION"));
 
         let before = get_json(&router, "/api/v1/stats").await;
         assert_eq!(before["total_requests"], 0);
-        assert!(before["last"].is_null());
+        assert_eq!(before["queue"]["pending"], 0);
 
         for stream in [false, true] {
             let resp = router
@@ -729,23 +757,52 @@ mod tests {
         }
         let after = get_json(&router, "/api/v1/stats").await;
         assert_eq!(after["total_requests"], 2);
+        assert_eq!(after["active_requests"], 0);
         assert_eq!(after["total_completion_tokens"], 6);
-        assert_eq!(after["last"]["model"], MODEL);
+        assert_eq!(after["recent"][0]["model"], MODEL);
+        assert_eq!(after["recent"][0]["stream"], true);
+        assert_eq!(after["recent"][0]["client"], "api");
 
         let devices = get_json(&router, "/api/v1/devices").await;
-        assert_eq!(devices["devices"][0]["loaded_model"], MODEL);
+        assert_eq!(devices[0]["id"], "mock0");
+        assert_eq!(devices[0]["loaded_model"], MODEL);
+        assert_eq!(devices[0]["power_mode"], "balanced");
+        assert_eq!(devices[0]["busy"], false);
+        assert!(devices[0]["telemetry"]["temperature_c"].as_f64().is_some());
     }
 
     #[tokio::test]
-    async fn serves_web_ui() {
-        let resp = app()
-            .oneshot(Request::get("/").body(Body::empty()).unwrap())
-            .await
+    async fn client_header_labels_requests() {
+        let router = router(state(Duration::ZERO));
+        let req = Request::post("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .header(CLIENT_HEADER, "playground")
+            .body(Body::from(simple(false, 3).to_string()))
             .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        assert!(body_string(resp)
-            .await
-            .contains("<title>TokenStick</title>"));
+        let v = get_json(&router, "/api/v1/stats").await;
+        assert_eq!(v["recent"][0]["client"], "playground");
+        assert_eq!(v["recent"][0]["finish_reason"], "length");
+    }
+
+    #[tokio::test]
+    async fn serves_web_ui_and_assets() {
+        let router = app();
+        for (path, needle) in [
+            ("/", "<title>TokenStick</title>"),
+            ("/ui/app.js", "/api/v1/events"),
+            ("/ui/app.css", "{"),
+            ("/ui/logo.svg", "<svg"),
+        ] {
+            let resp = router
+                .clone()
+                .oneshot(Request::get(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{path}");
+            assert!(body_string(resp).await.contains(needle), "{path}");
+        }
     }
 
     /// Minimal join_all so tests need no extra dependency.

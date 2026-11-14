@@ -1,9 +1,11 @@
 # Architecture
 
 ```
- OpenAI clients / Open WebUI / curl          tokenstick CLI
-                 |                                  |
-         tokenstick-server  <-----------------------+  (serve)
+ OpenAI clients / Open WebUI / curl    web UI (browser, Tauri)    tokenstick CLI
+                 |                       |  /api/v1/*, SSE             |
+                 +-----------+-----------+                             |
+                             |                                         |
+                     tokenstick-server  <------------------------------+  (serve)
                  |
            libtokenstick ── Backend trait
                  |
@@ -37,6 +39,12 @@ Contract:
 
 Each device has a single-permit semaphore, which gives a FIFO queue. A request is admitted before any response is sent: the model is checked (404), a device is picked, and a pending slot is reserved (503 when `max_pending`, default 8, is reached). The job then waits for its device, loads the model if needed and generates. Streaming and non-streaming requests share this path, so errors and back-pressure behave the same.
 
+## Web UI
+
+One UI, two shells. `tokenstick-server` embeds a plain HTML/CSS/JS UI (`crates/tokenstick-server/ui/`) and serves it at `/`, next to the OpenAI API. A management API (`/api/v1/info`, `/devices`, `/stats`, `/events`) feeds it; `/events` is server-sent events with one snapshot per second, which is enough for telemetry and keeps the server simple. WebSocket comes only if the UI needs to push commands. The desktop tray app (Phase 3) wraps the same UI with Tauri.
+
+The server keeps a small in-memory `Monitor` (active requests, totals, last 50 requests with their `GenerationStats`) so the dashboard can show throughput without polling the backend for history.
+
 ## Why PCIe first
 
 Every RK182X development platform available today connects RK1828 to its host over PCIe. Phase 0 therefore validates the runtime, models and API on PCIe (`pcie-vendor`). The USB transport is validated on the TokenStick board. Transport research notes from the kit go in this folder.
@@ -44,17 +52,6 @@ Every RK182X development platform available today connects RK1828 to its host ov
 ## Phase 0 plan
 
 See the TokenStick Software Plan doc. In short: mock backend and skeletons (0a), kit bring-up (0b), benchmarks and transport research (0c), `pcie-vendor` backend and real-hardware CLI/server (0d).
-
-## Management API and web UI
-
-| Endpoint | Returns |
-| --- | --- |
-| `GET /api/v1/info` | Version, backend, uptime, queue limit |
-| `GET /api/v1/devices` | Devices with telemetry, loaded model, busy flag |
-| `GET /api/v1/stats` | Last generation (model, TTFT, tok/s), totals, pending jobs |
-| `GET /api/v1/events` | SSE `tick` event once per second with `{devices, stats}` |
-
-The web UI is one HTML file (`crates/tokenstick-server/src/ui/index.html`) compiled into the binary with `include_str!` and served at `/`. Plain HTML/JS/CSS, no Node build step, so CI and cross-compiling stay unchanged. The same page is what a Tauri tray app will wrap later. Screens today: Dashboard, Playground, Server.
 
 ## Model store
 
