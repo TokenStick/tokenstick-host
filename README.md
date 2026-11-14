@@ -67,6 +67,7 @@ CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
 ## Docs
 
 - [Architecture](docs/architecture.md)
+- [RKNN3 runtime mapping](docs/rknn3-mapping.md): plan for the `pcie-vendor` backend
 
 ## License
 
