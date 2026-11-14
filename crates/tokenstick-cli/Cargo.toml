@@ -1,0 +1,22 @@
+[package]
+name = "tokenstick-cli"
+description = "Command-line tool for TokenStick"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "tokenstick"
+path = "src/main.rs"
+
+[dependencies]
+libtokenstick.workspace = true
+tokenstick-server.workspace = true
+clap.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tracing-subscriber.workspace = true
