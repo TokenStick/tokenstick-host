@@ -10,7 +10,7 @@ Host software for [TokenStick](https://github.com/TokenStick), the open-source U
 | --- | --- |
 | `libtokenstick` | Core library. Every caller reaches hardware only through the `Backend` trait. |
 | `tokenstick-server` | OpenAI-compatible HTTP API (`/v1/models`, `/v1/chat/completions` with streaming), management API (`/api/v1/*`) and the embedded web UI at `/`. Queues requests per device. |
-| `tokenstick-cli` | The `tokenstick` binary: `status`, `models`, `run`, `bench`, `serve`. |
+| `tokenstick-cli` | The `tokenstick` binary: `status`, `models`, `run`, `bench`, `power`, `store`, `serve`. |
 
 Models are loaded on demand: the first request for a model loads it onto a device (seconds on real hardware), later requests reuse it. Each device runs one job at a time; the server queues requests in FIFO order and answers `503` when more than 8 jobs are pending.
 
@@ -34,15 +34,32 @@ cargo build --release
 ./target/release/tokenstick serve --addr 127.0.0.1:8080
 ```
 
-Open `http://127.0.0.1:8080/` for the web UI: a live Dashboard (devices, temperature, power, NPU load, tok/s, TTFT, queue), a streaming chat Playground and copyable client snippets. On a headless host (the RK3576 kit, a Pi) open it from another machine's browser after `serve --addr 0.0.0.0:8080`.
-
-Or point any OpenAI client at `http://127.0.0.1:8080/v1`:
+Open `http://127.0.0.1:8080/` for the web UI (Dashboard, Playground, Server), or point any OpenAI client at `http://127.0.0.1:8080/v1`:
 
 ```sh
 curl -N http://127.0.0.1:8080/v1/chat/completions \
   -H 'content-type: application/json' \
   -d '{"model":"qwen2.5-1.5b-instruct-w4a16","messages":[{"role":"user","content":"hi"}],"stream":true}'
 ```
+
+## Web UI
+
+`tokenstick serve` also serves a web UI at `/`. It is plain HTML/CSS/JS compiled into the binary (`crates/tokenstick-server/ui/`), so headless hosts like the RK3576 kit or a Raspberry Pi serve it with no extra files and the build needs no Node toolchain. The same UI will be wrapped by Tauri for the desktop tray app.
+
+- **Dashboard**: devices (loaded model, power mode, busy), live temperature / power / NPU load, last 5 min chart, throughput per request, queue, recent requests with caller label (`x-tokenstick-client` header)
+- **Playground**: streaming chat with model picker, system prompt, temperature, top-p, max tokens
+- **Server**: endpoint URL and copyable curl / Python / JavaScript snippets
+
+Management API used by the UI:
+
+| Endpoint | Returns |
+| --- | --- |
+| `GET /api/v1/info` | Backend, version, uptime |
+| `GET /api/v1/devices` | Devices with telemetry, loaded model, power mode, busy flag |
+| `GET /api/v1/stats` | Request counters, the last 50 requests, queue (`pending` / `max_pending`) |
+| `GET /api/v1/events` | Server-sent events: a `snapshot` (devices + stats + queue) every second |
+
+Set the `x-tokenstick-client` header on `/v1/chat/completions` to label your requests on the dashboard.
 
 Environment variables:
 
@@ -54,6 +71,19 @@ Environment variables:
 | `TOKENSTICK_MOCK_DELAY_MS` | `25` | Per-token delay of the mock backend |
 | `TOKENSTICK_MOCK_LOAD_MS` | `300` | Model load time of the mock backend |
 | `RUST_LOG` | `info` | Log filter |
+
+## Installing on a Linux host (dev kit, Pi, server)
+
+Each tagged release ships x86_64 and aarch64 tarballs with the binary, a systemd unit and an installer:
+
+```sh
+curl -fsSLO https://raw.githubusercontent.com/TokenStick/tokenstick-host/main/scripts/install.sh
+sudo sh install.sh --version v0.1.0
+```
+
+This installs `/usr/local/bin/tokenstick`, enables `tokenstick.service` (config in `/etc/default/tokenstick`, models in `/var/lib/tokenstick/models`) and starts it. `sudo sh install.sh --uninstall` removes it.
+
+Other commands: `tokenstick power [low-power|balanced|performance]` shows or sets the NPU power mode; `tokenstick store list` checks the local model store.
 
 ## Cross-compiling for the dev kit
 
@@ -68,6 +98,8 @@ CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
 
 ## Docs
 
+- [Contributing](CONTRIBUTING.md): branch model (`main` / `development` / `feature/*`), versioning, release process
+- [Changelog](CHANGELOG.md)
 - [Architecture](docs/architecture.md)
 - [RKNN3 runtime mapping](docs/rknn3-mapping.md): plan for the `pcie-vendor` backend
 

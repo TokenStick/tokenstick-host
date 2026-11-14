@@ -2,7 +2,9 @@ use std::fmt;
 use std::ops::ControlFlow;
 use std::str::FromStr;
 
-use crate::{DeviceInfo, Error, GenerationRequest, GenerationStats, ModelInfo, Result, Telemetry};
+use crate::{
+    DeviceInfo, Error, GenerationRequest, GenerationStats, ModelInfo, PowerMode, Result, Telemetry,
+};
 
 pub mod mock;
 
@@ -42,6 +44,21 @@ pub trait Backend: Send + Sync {
 
     /// Free the device memory.
     fn unload_model(&self, device_id: &str) -> Result<()>;
+
+    /// Current NPU power profile. Backends without power control report `Balanced`.
+    fn power_mode(&self, device_id: &str) -> Result<PowerMode> {
+        let _ = device_id;
+        Ok(PowerMode::Balanced)
+    }
+
+    /// Change the NPU power profile. Benchmarks must record the mode they ran in.
+    fn set_power_mode(&self, device_id: &str, mode: PowerMode) -> Result<()> {
+        let _ = (device_id, mode);
+        Err(Error::Unsupported(format!(
+            "{} backend has no power control",
+            self.name()
+        )))
+    }
 
     /// Run a chat completion on `device_id`, streaming text into `sink`.
     fn generate(

@@ -36,6 +36,45 @@ pub struct ModelInfo {
     pub params_b: f32,
     pub quantization: String,
     pub context_len: u32,
+    /// Estimated host RAM the model needs while loaded, in MiB (RKNN3 keeps
+    /// the embedding table on the host). `None` when unknown.
+    #[serde(default)]
+    pub host_mem_mib: Option<u32>,
+}
+
+/// NPU power profile. Maps to RKNN3 `work_mode` 0 / 1 / 2.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum PowerMode {
+    LowPower,
+    #[default]
+    Balanced,
+    Performance,
+}
+
+impl std::str::FromStr for PowerMode {
+    type Err = crate::Error;
+
+    fn from_str(s: &str) -> crate::Result<Self> {
+        match s {
+            "low-power" | "low" | "0" => Ok(Self::LowPower),
+            "balanced" | "1" => Ok(Self::Balanced),
+            "performance" | "perf" | "2" => Ok(Self::Performance),
+            other => Err(crate::Error::InvalidRequest(format!(
+                "unknown power mode '{other}' (expected low-power, balanced or performance)"
+            ))),
+        }
+    }
+}
+
+impl std::fmt::Display for PowerMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::LowPower => "low-power",
+            Self::Balanced => "balanced",
+            Self::Performance => "performance",
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
